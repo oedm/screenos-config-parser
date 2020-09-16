@@ -6,6 +6,10 @@ import json
 from itertools import chain
 from collections import defaultdict, OrderedDict
 from netaddr import IPAddress
+import sys
+import time
+from pprint import pprint
+from jsondiff import diff
 
 
 def recursive_resolve(groups, objects):
@@ -13,10 +17,31 @@ def recursive_resolve(groups, objects):
     for g in group_dicts:
         for child_key in groups[g]:
             child = group_dicts.get(child_key, objects.get(child_key))
-            group_dicts[g][child_key] = child
-    not_top_levels = set(chain.from_iterable(groups.values()))  # Remove previously seen entries
-    result = {g: group_dicts[g] for g in group_dicts if g not in not_top_levels}
-    return result
+            # Edge case for nested Groups
+            if not child:
+                child = groups.get(child_key)
+                for subchild_key in child:
+                    subchild = group_dicts.get(subchild_key, objects.get(subchild_key))
+                    group_dicts[g][subchild_key] = subchild
+                # If we can't find the nested group even here, something is really bad.
+                if not child:
+                    print("Group: " + str(g), file=sys.stderr)
+                    print("Child not found for " + str(child_key), file=sys.stderr)
+                    sys.exit(1)
+            else:
+                group_dicts[g][child_key] = child
+
+        # if g == "G_EQU_Cisco_Firewalls":
+        #     print("G_EQU_Cisco_Firewalls after lookup")
+        #     pprint(group_dicts[g])
+    # not_top_levels = set(chain.from_iterable(groups.values()))  # Remove previously seen entries
+    # result = {g: group_dicts[g] for g in group_dicts if g not in not_top_levels}
+    # json1 = json.dumps(group_dicts, sort_keys=True)
+    # json2 = json.dumps(result, sort_keys=True)
+    # print(json1 == json2)
+    # pprint(diff(result, group_dicts))
+    # return result
+    return group_dicts
 
 
 def recursive_lookup(k, d):
@@ -360,9 +385,18 @@ def sos_parse_srv_objects(config_lines):
         if re.search('service.*port\s\d{1,5}-\d{1,5}', line):
             srv_name = line.split('"')[1]
             srv_definition = line.split('"')[2].split()
+            # if srv_definition[0] == "+":
+            #     # Edge Case, where no fucking service group is defined.
+            #     # 
+            #     continue
+            #     print("Edge Case: Service Definition:")
+            #     print(srv_name, str(srv_definition))
 
+            # print("SRV_NAME:" + str(srv_definition))
+            # time.sleep(5)
             # Handle protocols
             if srv_definition[1].isdigit():  # Handle non-TCP/UDP protocols
+                # print("NON TCP/UDP")
                 srv_proto = 'ip-' + str(srv_definition[1])
             else:
                 srv_proto = srv_definition[1] + '_src_' + srv_definition[3] + '_dst_' + srv_definition[5]
@@ -382,13 +416,22 @@ def sos_parse_srv_objects(config_lines):
             #     srv_group_comment = line.split('"')[3]
             if line.split('"')[2].strip() == 'add':
                 srv_groups[srv_group_name].append(line.split('"')[3])
-
+        
+        # Handle icmp service objects
+        # set service "ICMP" protocol 1 src-port 0-65535 dst-port 0-65535
+        # set service "S_ICMP_8" protocol icmp type 8 code 0 
+        if re.search('service.*protocol icmp type \d code \d', line):
+            srv_name = line.split('"')[1]
+            srv_definition = line.split('"')[2].split()
+            srv_proto = srv_definition[1] + '_type_' + srv_definition[3] + '_code_' + srv_definition[5]
+            srv_objects[srv_name].append(srv_proto)
+    
     return srv_objects, srv_groups
 
 
 if __name__ == '__main__':
     # Read in raw config / output files
-    config_in_file_path = 'input/MGT-CLOUD_run_conf.txt'
+    config_in_file_path = 'input/screenos_config.txt'
     def_srv_obj_lines = txt_to_list('input/sos_predef_srv_objects.txt')
     def_srv_group_lines = txt_to_list('input/sos_predef_srv_groups.txt')
     config_out_file_path = 'output/MGT-CLOUD_run_conf.json'
@@ -409,12 +452,18 @@ if __name__ == '__main__':
     # Resolve nested service groups
     resolved_srv_objects = recursive_resolve(srv_groups, srv_objects)
     [resolved_srv_objects.update({k: v}) for k, v in srv_objects.items() if k not in resolved_srv_objects]
+    # for k, v in srv_objects.items():
+    #     if k not in resolved_srv_objects:
+    #         print("Not resolved:" + k)
+    #         if k == "SG_Windows_default_reviewed":
+    #             print("EDGE")
+    #         resolved_srv_objects.update({k: v})
 
     # Combine firewall policies based on policy ID (Removing newlines)
     combined_pol_set = sos_combine_policy_rules(config_lines)
     parsed_filter_rules = sos_parse_filter_rules(combined_pol_set)  # Parse filter rules
-    parsed_nat_rules = sos_parse_nat_rules(combined_pol_set, config_lines)  # Parse NAT rules
-    [parsed_filter_rules[key].update(parsed_nat_rules[key]) for key in parsed_filter_rules]  # Merge the dicts
+    #parsed_nat_rules = sos_parse_nat_rules(combined_pol_set, config_lines)  # Parse NAT rules
+    #[parsed_filter_rules[key].update(parsed_nat_rules[key]) for key in parsed_filter_rules]  # Merge the dicts
 
     # Replace objects inline
     for rule in parsed_filter_rules:
@@ -435,4 +484,4 @@ if __name__ == '__main__':
 
     # Output config file to JSON
     with open('output/MGT-CLOUD_run_conf.json', "w") as f:
-        json.dump(parsed_filter_rules, f)
+        json.dump(parsed_filter_rules, f, sort_keys=True, indent=4)
